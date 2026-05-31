@@ -1,0 +1,1090 @@
+# =============================================================================
+# THE AURA – ESPHome Firmware v1.1
+# Diffusore di fragranze con ESP32-S3
+# Spec: SPEC.md
+# =============================================================================
+
+# --- SUBSTITUTIONS (parametri configurabili) ---
+substitutions:
+  device_name: "the-aura"
+  friendly_name: "The Aura"
+  # §2.2 - Beep duration (ms)
+  beep_ms: "100"
+  # §feedback - Blink: 3x, 20ms on / 200ms off
+  blink_on_ms: "20"
+  blink_off_ms: "200"
+  # §4 - Power animation: 100ms per LED
+  anim_step_ms: "100"
+  # §8.4 - HSV hue step per press (degrees)
+  hue_step: "10"
+  # §5 - Idle display cycle interval
+  idle_interval: "2s"
+  # Pin assignments (§1 hardware)
+  pin_fan_pwm: GPIO13
+  pin_fan_rpm: GPIO14
+  pin_progress_led: GPIO7
+  pin_cursor_led: GPIO18
+  pin_buzzer: GPIO6
+  pin_spi_clk: GPIO21
+  pin_spi_mosi: GPIO4
+  pin_display_cs: GPIO5
+  pin_i2c_sda: GPIO1
+  pin_i2c_scl: GPIO2
+  pin_btn_power: GPIO12
+  pin_btn_wind: GPIO11
+  pin_btn_light: GPIO10
+  pin_btn_time: GPIO9
+  pin_btn_plus: GPIO48
+  pin_btn_ok: GPIO19
+  pin_btn_minus: GPIO47
+  pin_btn_esc: GPIO20
+
+# --- CORE ESP32-S3 (§1) ---
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  platformio_options:
+    board_build.flash_mode: dio
+  on_boot:
+    priority: -100
+    then:
+      # §3 - Restore persisted state on boot
+      - lambda: |-
+          // Apply saved fan speed if device was ON
+          if (id(device_on)) {
+            id(fan_pwm_output).set_level(id(fan_speed_pct) / 100.0f);
+            if (id(timer_set_min) > 0) {
+              id(timer_remaining_sec) = id(timer_set_min) * 60;
+              id(timer_running) = true;
+            }
+          } else {
+            id(fan_pwm_output).set_level(0.0f);
+          }
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: arduino
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+# --- GLOBALS (§3 stato persistente + state machine) ---
+globals:
+  # §3 - Device ON/OFF state
+  - id: device_on
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+
+  # §6 - Fan speed 0-100%
+  - id: fan_speed_pct
+    type: int
+    restore_value: yes
+    initial_value: "50"
+
+  # §7 - Timer set value in minutes (0=permanent)
+  - id: timer_set_min
+    type: int
+    restore_value: yes
+    initial_value: "30"
+
+  # §7.3 - Countdown remaining in seconds
+  - id: timer_remaining_sec
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  # §7.3 - Countdown running flag
+  - id: timer_running
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  # §8.2 - Light effect index (0-11)
+  - id: light_effect_idx
+    type: int
+    restore_value: yes
+    initial_value: "0"
+
+  # §8.3 - Light intensity 1-10
+  - id: light_intensity
+    type: int
+    restore_value: yes
+    initial_value: "5"
+
+  # §8.4 - Light hue 0-350 (step 10)
+  - id: light_hue
+    type: int
+    restore_value: yes
+    initial_value: "0"
+
+  # State machine: 0=idle, 1=wind, 2=time,
+  # 3=light_menu, 4=light_effect, 5=light_intensity, 6=light_color
+  - id: edit_mode
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  # §9.2 - Light menu index: 0=Effect, 1=Intensity, 2=Color
+  - id: menu_idx
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  # §5 - Idle display screen: 0=fragrance, 1=time, 2=fan
+  - id: idle_screen
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  # ESC/OK original value backup
+  - id: edit_orig_val
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  # Display blink feedback
+  - id: blink_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: blink_phase
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  # Display temporary message: 0=none, 1=power_on, 2=power_off
+  - id: display_msg
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  # Scroll offset for long text
+  - id: scroll_offset
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  # §11 - Cursor LED position (0-6), LED 0 = ore 12
+  - id: cursor_pos
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  # Cursor animation state
+  - id: cursor_animating
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: cursor_anim_step
+    type: int
+    restore_value: no
+    initial_value: "0"
+  # 0=white(PLUS/MINUS), 1=green(OK), 2=red(ESC)
+  - id: cursor_color
+    type: int
+    restore_value: no
+    initial_value: "0"
+  # Cursor anim mode: 0=button, 1=power_on, 2=power_off
+  - id: cursor_anim_mode
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+# --- BUS (§1 hardware) ---
+i2c:
+  sda: ${pin_i2c_sda}
+  scl: ${pin_i2c_scl}
+  frequency: 400kHz
+  id: i2c_bus
+
+spi:
+  clk_pin: ${pin_spi_clk}
+  mosi_pin: ${pin_spi_mosi}
+
+# --- FONT (§1 display: Silkscreen 8px) ---
+font:
+  - file:
+      type: gfonts
+      family: Silkscreen
+    id: font_slks
+    size: 8
+    glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+# --- OUTPUTS (§1 hardware) ---
+output:
+  # §6 - Fan PWM LEDC 25kHz
+  - platform: ledc
+    pin: ${pin_fan_pwm}
+    id: fan_pwm_output
+    frequency: 25000Hz
+
+  # §2.2 - Buzzer PWM
+  - platform: ledc
+    pin: ${pin_buzzer}
+    id: buzzer_output
+
+# --- BUZZER (§2.2 feedback sonoro) ---
+rtttl:
+  output: buzzer_output
+  id: buzzer
+
+# --- SENSORS ---
+sensor:
+  # §1 - Fan RPM via pulse counter
+  - platform: pulse_counter
+    pin: ${pin_fan_rpm}
+    name: "${friendly_name} Fan RPM"
+    id: fan_rpm
+    update_interval: 3s
+    filters:
+      - multiply: 0.5
+
+# --- NFC (§10 PN532 I2C) ---
+text_sensor:
+  - platform: template
+    id: fragrance_name
+    name: "${friendly_name} Fragrance"
+
+pn532_i2c:
+  id: nfc_reader
+  i2c_id: i2c_bus
+  update_interval: 2s
+  on_tag:
+    then:
+      # §10 - Read fragrance name from NDEF text record
+      - lambda: |-
+          if (tag.has_ndef_message()) {
+            auto msg = tag.get_ndef_message();
+            auto records = msg->get_records();
+            for (auto &record : records) {
+              std::string payload = record->get_payload();
+              // NDEF text record: 1 byte status + N bytes lang code + text
+              if (payload.length() > 0) {
+                uint8_t lang_len = payload[0] & 0x3F;
+                if ((int)payload.length() > 1 + lang_len) {
+                  payload = payload.substr(1 + lang_len);
+                }
+              }
+              id(fragrance_name).publish_state(payload);
+              break;
+            }
+          } else {
+            // Tag without NDEF - show UID
+            id(fragrance_name).publish_state("Tag OK");
+          }
+  on_tag_removed:
+    then:
+      - lambda: 'id(fragrance_name).publish_state("");'
+
+# --- LIGHTS ---
+# §8 - Progress LED: 20x WS2812 GRB circular
+light:
+  - platform: neopixelbus
+    id: progress_led
+    name: "${friendly_name} Progress LED"
+    variant: WS2812X
+    type: GRB
+    pin: ${pin_progress_led}
+    num_leds: 20
+    method:
+      type: esp32_rmt
+      channel: 0
+    default_transition_length: 0ms
+    effects:
+      # §8.1 - Custom progress effect linked to countdown
+      - addressable_lambda:
+          name: "Progresso"
+          update_interval: 100ms
+          lambda: |-
+            // HSV to RGB helper (S=100%, V=100%)
+            float h_norm = id(light_hue) / 360.0f;
+            int hi = (int)(h_norm * 6.0f) % 6;
+            float f = h_norm * 6.0f - (int)(h_norm * 6.0f);
+            float q = 1.0f - f;
+            float t_val = f;
+            uint8_t r, g, b;
+            switch (hi) {
+              case 0: r=255; g=(uint8_t)(t_val*255); b=0; break;
+              case 1: r=(uint8_t)(q*255); g=255; b=0; break;
+              case 2: r=0; g=255; b=(uint8_t)(t_val*255); break;
+              case 3: r=0; g=(uint8_t)(q*255); b=255; break;
+              case 4: r=(uint8_t)(t_val*255); g=0; b=255; break;
+              default: r=255; g=0; b=(uint8_t)(q*255); break;
+            }
+            Color color = Color(r, g, b);
+
+            int set_min = id(timer_set_min);
+            if (set_min == 0) {
+              // §8.1 - Permanent mode: pulse all 20 LEDs
+              static uint8_t pulse_val = 0;
+              static int8_t pulse_dir = 5;
+              pulse_val += pulse_dir;
+              if (pulse_val >= 250) { pulse_val = 250; pulse_dir = -5; }
+              if (pulse_val <= 5) { pulse_val = 5; pulse_dir = 5; }
+              Color dimmed = Color(
+                (uint8_t)(r * pulse_val / 255),
+                (uint8_t)(g * pulse_val / 255),
+                (uint8_t)(b * pulse_val / 255)
+              );
+              it.all() = dimmed;
+            } else {
+              // §8.1 - Progress bar: LEDs off anti-clockwise
+              int set_sec = set_min * 60;
+              int rem_sec = id(timer_remaining_sec);
+              int num_lit = 0;
+              if (set_sec > 0) {
+                num_lit = (int)round((float)rem_sec / (float)set_sec * 20.0f);
+              }
+              for (int i = 0; i < it.size(); i++) {
+                if (i < num_lit) {
+                  it[i] = color;
+                } else {
+                  it[i] = Color::BLACK;
+                }
+              }
+            }
+      # §8.2 - Native ESPHome effects
+      - random:
+          name: "Random"
+      - pulse:
+          name: "Pulse"
+      - strobe:
+          name: "Strobe"
+      - flicker:
+          name: "Flicker"
+      - addressable_rainbow:
+          name: "Addressable Rainbow"
+      - addressable_color_wipe:
+          name: "Addressable Color Wipe"
+      - addressable_scan:
+          name: "Addressable Scan"
+      - addressable_twinkle:
+          name: "Addressable Twinkle"
+      - addressable_random_twinkle:
+          name: "Addressable Random Twinkle"
+      - addressable_fireworks:
+          name: "Addressable Fireworks"
+      - addressable_flicker:
+          name: "Addressable Flicker"
+
+  # §11 - Cursor LED: 7x WS2811 GRB circular (functional only)
+  - platform: neopixelbus
+    id: cursor_led
+    name: "${friendly_name} Cursor LED"
+    variant: WS2811
+    type: GRB
+    pin: ${pin_cursor_led}
+    num_leds: 7
+    method:
+      type: esp32_rmt
+      channel: 1
+    default_transition_length: 0ms
+    effects:
+      - addressable_lambda:
+          name: "Cursor Active"
+          update_interval: 50ms
+          lambda: |-
+            // §11 - Cursor LED animation driven by globals
+            it.all() = Color::BLACK;
+            if (!id(cursor_animating)) return;
+
+            Color c;
+            switch (id(cursor_color)) {
+              case 0: c = Color(255, 255, 255); break;  // White
+              case 1: c = Color(0, 255, 0); break;      // Green
+              case 2: c = Color(255, 0, 0); break;      // Red
+              default: c = Color(255, 255, 255); break;
+            }
+            int mode = id(cursor_anim_mode);
+            int step = id(cursor_anim_step);
+
+            if (mode == 0) {
+              // §2.1 - Button press: progressive from cursor_pos
+              for (int i = 0; i <= step && i < 3; i++) {
+                it[(id(cursor_pos) + i) % 7] = c;
+              }
+            } else if (mode == 1) {
+              // §4.1 - Power ON: clockwise from LED 0
+              for (int i = 0; i <= step && i < 7; i++) {
+                it[i] = c;
+              }
+            } else if (mode == 2) {
+              // §4.2 - Power OFF: all on, then off anti-clockwise from 0
+              for (int i = step; i < 7; i++) {
+                it[i] = c;
+              }
+            }
+
+# --- DISPLAY (§1, §5, §6, §7, §9) ---
+display:
+  - platform: max7219digit
+    id: main_display
+    cs_pin: ${pin_display_cs}
+    num_chips: 4
+    intensity: 5
+    reverse_enable: false
+    update_interval: 100ms
+    lambda: |-
+      // §3 - Device OFF: blank display
+      if (!id(device_on)) return;
+
+      // §4 - Temporary power messages
+      if (id(display_msg) != 0) {
+        if (id(display_msg) == 1) {
+          it.print(0, 0, id(font_slks), "ON");
+        } else if (id(display_msg) == 2) {
+          it.print(0, 0, id(font_slks), "OFF");
+        }
+        return;
+      }
+
+      // Blink feedback: hide on blink_off phase
+      if (id(blink_active) && !id(blink_phase)) return;
+
+      int mode = id(edit_mode);
+
+      // Effect name lookup table (§8.2)
+      static const char* FX_SHORT[] = {
+        "Progr", "Rand", "Pulse", "Strob", "Flick",
+        "Rainb", "Wipe", "Scan", "Twink", "RTwnk",
+        "Firew", "AFlck"
+      };
+
+      if (mode == 0) {
+        // §5 - Idle cycle
+        int screen = id(idle_screen);
+        if (screen == 0) {
+          // §5.1 / §10 - Fragrance name (scrolling if long)
+          std::string name = id(fragrance_name).state;
+          if (name.empty()) name = "No cart";
+          int char_w = 6;  // approx pixel width per char
+          int text_w = name.length() * char_w;
+          int disp_w = 32;
+          if (text_w > disp_w) {
+            int total = text_w + disp_w;
+            int off = id(scroll_offset) % total;
+            it.print(disp_w - off, 0, id(font_slks), name.c_str());
+          } else {
+            it.print(0, 0, id(font_slks), name.c_str());
+          }
+        } else if (screen == 1) {
+          // §5.2 - Time remaining MM:SS
+          int rem = id(timer_remaining_sec);
+          if (!id(timer_running) && id(timer_set_min) == 0) {
+            it.print(0, 0, id(font_slks), "PERM");
+          } else {
+            it.printf(0, 0, id(font_slks), "%02d:%02d", rem / 60, rem % 60);
+          }
+        } else {
+          // §5.3 - Fan speed %
+          it.printf(0, 0, id(font_slks), "%3d%%", id(fan_speed_pct));
+        }
+      } else if (mode == 1) {
+        // §6 - Wind editing
+        it.printf(0, 0, id(font_slks), "%3d%%", id(fan_speed_pct));
+      } else if (mode == 2) {
+        // §7 - Time editing MM:SS
+        int t = id(timer_set_min);
+        it.printf(0, 0, id(font_slks), "%02d:00", t);
+      } else if (mode == 3) {
+        // §9.2 - Light menu navigation
+        static const char* MENUS[] = {"FX", "Brt", "Color"};
+        it.print(0, 0, id(font_slks), MENUS[id(menu_idx)]);
+      } else if (mode == 4) {
+        // §9.3 - Light effect name
+        it.print(0, 0, id(font_slks), FX_SHORT[id(light_effect_idx)]);
+      } else if (mode == 5) {
+        // §9.4 - Light intensity
+        it.printf(0, 0, id(font_slks), "I:%2d", id(light_intensity));
+      } else if (mode == 6) {
+        // §9.5 - Light color HSV hue
+        it.printf(0, 0, id(font_slks), "H:%3d", id(light_hue));
+      }
+
+# --- BINARY SENSORS (§1 tasti) ---
+binary_sensor:
+  # §4 - Power button (bistable)
+  - platform: gpio
+    id: btn_power
+    name: "${friendly_name} Power"
+    pin:
+      number: ${pin_btn_power}
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      then:
+        # §4.1 - Power ON sequence
+        - rtttl.play:
+            rtttl: "beep:d=16,o=5,b=150:g"
+        - lambda: |-
+            id(device_on) = true;
+            id(display_msg) = 1;  // Show "ON"
+            id(edit_mode) = 0;
+        # §4.1 - Cursor LED animation: clockwise from LED 0
+        - lambda: |-
+            id(cursor_anim_mode) = 1;
+            id(cursor_color) = 0;  // white
+            id(cursor_animating) = true;
+            id(cursor_anim_step) = 0;
+        - light.turn_on:
+            id: cursor_led
+            effect: "Cursor Active"
+        # Animate 7 LEDs one by one (100ms each)
+        - delay: !lambda "return ${anim_step_ms};"
+        - lambda: 'id(cursor_anim_step) = 1;'
+        - delay: !lambda "return ${anim_step_ms};"
+        - lambda: 'id(cursor_anim_step) = 2;'
+        - delay: !lambda "return ${anim_step_ms};"
+        - lambda: 'id(cursor_anim_step) = 3;'
+        - delay: !lambda "return ${anim_step_ms};"
+        - lambda: 'id(cursor_anim_step) = 4;'
+        - delay: !lambda "return ${anim_step_ms};"
+        - lambda: 'id(cursor_anim_step) = 5;'
+        - delay: !lambda "return ${anim_step_ms};"
+        - lambda: 'id(cursor_anim_step) = 6;'
+        - delay: !lambda "return ${anim_step_ms};"
+        # §4.1 - Animation complete, turn off cursor
+        - lambda: 'id(cursor_animating) = false;'
+        - light.turn_off: cursor_led
+        - lambda: 'id(display_msg) = 0;'
+        # Start fan and timer with saved values
+        - script.execute: apply_fan_speed
+        - script.execute: apply_light_settings
+        - lambda: |-
+            if (id(timer_set_min) > 0 && id(fan_speed_pct) > 0) {
+              id(timer_remaining_sec) = id(timer_set_min) * 60;
+              id(timer_running) = true;
+            } else {
+              id(timer_running) = false;
+            }
+    on_release:
+      then:
+        # §4.2 - Power OFF sequence
+        - rtttl.play:
+            rtttl: "beep:d=16,o=5,b=150:g"
+        - lambda: |-
+            id(display_msg) = 2;  // Show "OFF"
+            id(edit_mode) = 0;
+        # §4.2 - Stop fan
+        - lambda: 'id(fan_pwm_output).set_level(0.0f);'
+        - lambda: 'id(timer_running) = false;'
+        # §4.2 - Turn off Progress LED
+        - light.turn_off: progress_led
+        # §4.2 - Cursor LED: all on, then off anti-clockwise
+        - lambda: |-
+            id(cursor_anim_mode) = 2;
+            id(cursor_color) = 0;
+            id(cursor_animating) = true;
+            id(cursor_anim_step) = 0;
+        - light.turn_on:
+            id: cursor_led
+            effect: "Cursor Active"
+        - delay: !lambda "return ${anim_step_ms};"
+        - lambda: 'id(cursor_anim_step) = 1;'
+        - delay: !lambda "return ${anim_step_ms};"
+        - lambda: 'id(cursor_anim_step) = 2;'
+        - delay: !lambda "return ${anim_step_ms};"
+        - lambda: 'id(cursor_anim_step) = 3;'
+        - delay: !lambda "return ${anim_step_ms};"
+        - lambda: 'id(cursor_anim_step) = 4;'
+        - delay: !lambda "return ${anim_step_ms};"
+        - lambda: 'id(cursor_anim_step) = 5;'
+        - delay: !lambda "return ${anim_step_ms};"
+        - lambda: 'id(cursor_anim_step) = 6;'
+        - delay: !lambda "return ${anim_step_ms};"
+        - lambda: |-
+            id(cursor_animating) = false;
+            id(display_msg) = 0;
+            id(device_on) = false;
+        - light.turn_off: cursor_led
+
+  # §6 - Wind button (bistable)
+  - platform: gpio
+    id: btn_wind
+    name: "${friendly_name} Wind"
+    pin:
+      number: ${pin_btn_wind}
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      then:
+        - lambda: |-
+            // §6.1 - Enter wind edit mode (only if ON and idle)
+            if (!id(device_on) || id(edit_mode) != 0) return;
+            id(edit_mode) = 1;
+            id(edit_orig_val) = id(fan_speed_pct);
+        - rtttl.play:
+            rtttl: "beep:d=16,o=6,b=150:d"
+    on_release:
+      then:
+        - lambda: |-
+            // Implicit ESC on toggle release
+            if (id(edit_mode) == 1) {
+              id(fan_speed_pct) = id(edit_orig_val);
+              id(edit_mode) = 0;
+            }
+
+  # §7 - Time button (bistable)
+  - platform: gpio
+    id: btn_time
+    name: "${friendly_name} Time"
+    pin:
+      number: ${pin_btn_time}
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      then:
+        - lambda: |-
+            // §7.1 - Enter time edit mode
+            if (!id(device_on) || id(edit_mode) != 0) return;
+            id(edit_mode) = 2;
+            id(edit_orig_val) = id(timer_set_min);
+        - rtttl.play:
+            rtttl: "beep:d=16,o=6,b=150:f"
+    on_release:
+      then:
+        - lambda: |-
+            if (id(edit_mode) == 2) {
+              id(timer_set_min) = id(edit_orig_val);
+              id(edit_mode) = 0;
+            }
+
+  # §9 - Light button (bistable)
+  - platform: gpio
+    id: btn_light
+    name: "${friendly_name} Light"
+    pin:
+      number: ${pin_btn_light}
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      then:
+        - lambda: |-
+            // §9.1 - Enter light menu
+            if (!id(device_on) || id(edit_mode) != 0) return;
+            id(edit_mode) = 3;
+            id(menu_idx) = 0;
+        - rtttl.play:
+            rtttl: "beep:d=16,o=5,b=150:b"
+    on_release:
+      then:
+        - lambda: |-
+            // Exit light menu on toggle release (implicit ESC)
+            if (id(edit_mode) >= 3 && id(edit_mode) <= 6) {
+              // Restore if in sub-editing
+              if (id(edit_mode) == 4) id(light_effect_idx) = id(edit_orig_val);
+              if (id(edit_mode) == 5) id(light_intensity) = id(edit_orig_val);
+              if (id(edit_mode) == 6) {
+                id(light_hue) = id(edit_orig_val);
+                // §9.5 - Restore previous color on ESC
+              }
+              id(edit_mode) = 0;
+              id(apply_light_settings).execute();
+            }
+
+  # §2 - PLUS button (momentary, ore 12)
+  - platform: gpio
+    id: btn_plus
+    name: "${friendly_name} Plus"
+    pin:
+      number: ${pin_btn_plus}
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on: 10ms
+    on_press:
+      then:
+        - lambda: |-
+            if (!id(device_on)) return;
+            int mode = id(edit_mode);
+            if (mode == 0) return;  // No effect in idle
+        - rtttl.play:
+            rtttl: "beep:d=16,o=6,b=150:c"
+        # §2.1 - Cursor LED feedback (white)
+        - script.execute: cursor_btn_white
+        - lambda: |-
+            int mode = id(edit_mode);
+            if (mode == 1) {
+              // §6.2 - Increase fan speed +1%
+              if (id(fan_speed_pct) < 100) id(fan_speed_pct)++;
+            } else if (mode == 2) {
+              // §7.2 - Increase time +1 min
+              if (id(timer_set_min) < 60) id(timer_set_min)++;
+            } else if (mode == 3) {
+              // §9.2 - Cycle light menu forward
+              id(menu_idx) = (id(menu_idx) + 1) % 3;
+            } else if (mode == 4) {
+              // §9.3 - Cycle effect forward
+              id(light_effect_idx) = (id(light_effect_idx) + 1) % 12;
+            } else if (mode == 5) {
+              // §9.4 - Increase intensity
+              if (id(light_intensity) < 10) id(light_intensity)++;
+            } else if (mode == 6) {
+              // §9.5 - Increase hue +10°
+              id(light_hue) = (id(light_hue) + ${hue_step}) % 360;
+              // §9.5 - Real-time preview
+              id(apply_light_settings).execute();
+            }
+
+  # §2 - MINUS button (momentary, ore 6)
+  - platform: gpio
+    id: btn_minus
+    name: "${friendly_name} Minus"
+    pin:
+      number: ${pin_btn_minus}
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on: 10ms
+    on_press:
+      then:
+        - lambda: |-
+            if (!id(device_on)) return;
+            if (id(edit_mode) == 0) return;
+        - rtttl.play:
+            rtttl: "beep:d=16,o=6,b=150:c"
+        - script.execute: cursor_btn_white
+        - lambda: |-
+            int mode = id(edit_mode);
+            if (mode == 1) {
+              // §6.2 - Decrease fan speed -1%
+              if (id(fan_speed_pct) > 0) id(fan_speed_pct)--;
+            } else if (mode == 2) {
+              // §7.2 - Decrease time -1 min
+              if (id(timer_set_min) > 0) id(timer_set_min)--;
+            } else if (mode == 3) {
+              // §9.2 - Cycle light menu backward
+              id(menu_idx) = (id(menu_idx) + 2) % 3;
+            } else if (mode == 4) {
+              // §9.3 - Cycle effect backward
+              id(light_effect_idx) = (id(light_effect_idx) + 11) % 12;
+            } else if (mode == 5) {
+              // §9.4 - Decrease intensity
+              if (id(light_intensity) > 1) id(light_intensity)--;
+            } else if (mode == 6) {
+              // §9.5 - Decrease hue -10°
+              id(light_hue) = (id(light_hue) - ${hue_step} + 360) % 360;
+              id(apply_light_settings).execute();
+            }
+
+  # §2 - OK button (momentary, ore 3)
+  - platform: gpio
+    id: btn_ok
+    name: "${friendly_name} OK"
+    pin:
+      number: ${pin_btn_ok}
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on: 10ms
+    on_press:
+      then:
+        - lambda: |-
+            if (!id(device_on)) return;
+            if (id(edit_mode) == 0) return;
+        - rtttl.play:
+            rtttl: "beep:d=16,o=6,b=150:e"
+        # §2.1 - Cursor LED feedback (green)
+        - script.execute: cursor_btn_green
+        - lambda: |-
+            int mode = id(edit_mode);
+            if (mode == 1) {
+              // §6.2 - Confirm fan speed → apply and exit
+              id(edit_mode) = 0;
+              id(apply_fan_speed).execute();
+              id(apply_light_settings).execute();
+            } else if (mode == 2) {
+              // §7.2 - Confirm time → start/update countdown
+              if (id(timer_set_min) > 0) {
+                id(timer_remaining_sec) = id(timer_set_min) * 60;
+                id(timer_running) = true;
+              } else {
+                // §7.3 - Permanent: no countdown
+                id(timer_remaining_sec) = 0;
+                id(timer_running) = false;
+              }
+              id(edit_mode) = 0;
+              id(apply_light_settings).execute();
+            } else if (mode == 3) {
+              // §9.2 - Enter selected submenu
+              int sub = id(menu_idx);
+              if (sub == 0) {
+                id(edit_mode) = 4;
+                id(edit_orig_val) = id(light_effect_idx);
+              } else if (sub == 1) {
+                id(edit_mode) = 5;
+                id(edit_orig_val) = id(light_intensity);
+              } else {
+                id(edit_mode) = 6;
+                id(edit_orig_val) = id(light_hue);
+              }
+            } else if (mode == 4) {
+              // §9.3 - Confirm effect selection
+              id(edit_mode) = 3;
+              id(apply_light_settings).execute();
+            } else if (mode == 5) {
+              // §9.4 - Confirm intensity
+              id(edit_mode) = 3;
+              id(apply_light_settings).execute();
+            } else if (mode == 6) {
+              // §9.5 - Confirm color
+              id(edit_mode) = 3;
+              id(apply_light_settings).execute();
+            }
+        # Blink feedback
+        - script.execute: blink_feedback
+
+  # §2 - ESC button (momentary, ore 9)
+  - platform: gpio
+    id: btn_esc
+    name: "${friendly_name} ESC"
+    pin:
+      number: ${pin_btn_esc}
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on: 10ms
+    on_press:
+      then:
+        - lambda: |-
+            if (!id(device_on)) return;
+            if (id(edit_mode) == 0) return;
+        - rtttl.play:
+            rtttl: "beep:d=16,o=5,b=150:a"
+        # §2.1 - Cursor LED feedback (red)
+        - script.execute: cursor_btn_red
+        - lambda: |-
+            int mode = id(edit_mode);
+            if (mode == 1) {
+              // §6.2 - ESC: restore original fan speed
+              id(fan_speed_pct) = id(edit_orig_val);
+              id(edit_mode) = 0;
+            } else if (mode == 2) {
+              // §7.2 - ESC: restore original time
+              id(timer_set_min) = id(edit_orig_val);
+              id(edit_mode) = 0;
+            } else if (mode == 3) {
+              // §9.2 - ESC: exit light menu
+              id(edit_mode) = 0;
+            } else if (mode == 4) {
+              // §9.3 - ESC: restore effect, back to menu
+              id(light_effect_idx) = id(edit_orig_val);
+              id(edit_mode) = 3;
+              id(apply_light_settings).execute();
+            } else if (mode == 5) {
+              // §9.4 - ESC: restore intensity, back to menu
+              id(light_intensity) = id(edit_orig_val);
+              id(edit_mode) = 3;
+              id(apply_light_settings).execute();
+            } else if (mode == 6) {
+              // §9.5 - ESC: restore color, back to menu
+              id(light_hue) = id(edit_orig_val);
+              id(edit_mode) = 3;
+              id(apply_light_settings).execute();
+            }
+        # Blink feedback
+        - script.execute: blink_feedback
+
+# --- SCRIPTS ---
+script:
+  # Apply fan PWM speed from global
+  - id: apply_fan_speed
+    then:
+      - lambda: |-
+          // §6 - Set fan PWM duty cycle
+          if (id(device_on)) {
+            id(fan_pwm_output).set_level(id(fan_speed_pct) / 100.0f);
+          } else {
+            id(fan_pwm_output).set_level(0.0f);
+          }
+
+  # Apply Progress LED settings (effect, color, brightness)
+  - id: apply_light_settings
+    then:
+      - lambda: |-
+          // §8 - Update Progress LED
+          if (!id(device_on) || id(fan_speed_pct) == 0) {
+            // Fan off or device off → LED off
+            auto call = id(progress_led).turn_off();
+            call.perform();
+            return;
+          }
+          auto call = id(progress_led).turn_on();
+          // §8.3 - Brightness from intensity (1-10 → 0.1-1.0)
+          call.set_brightness(id(light_intensity) / 10.0f);
+          // §8.4 - Color from HSV hue (S=100%, V=100%)
+          float h = id(light_hue) / 360.0f;
+          int hi = (int)(h * 6.0f) % 6;
+          float f = h * 6.0f - (int)(h * 6.0f);
+          float r, g, b;
+          switch (hi) {
+            case 0: r=1; g=f; b=0; break;
+            case 1: r=1-f; g=1; b=0; break;
+            case 2: r=0; g=1; b=f; break;
+            case 3: r=0; g=1-f; b=1; break;
+            case 4: r=f; g=0; b=1; break;
+            default: r=1; g=0; b=1-f; break;
+          }
+          call.set_rgb(r, g, b);
+          // §8.2 - Set active effect
+          static const char* EFFECTS[] = {
+            "Progresso", "Random", "Pulse", "Strobe", "Flicker",
+            "Addressable Rainbow", "Addressable Color Wipe",
+            "Addressable Scan", "Addressable Twinkle",
+            "Addressable Random Twinkle", "Addressable Fireworks",
+            "Addressable Flicker"
+          };
+          call.set_effect(EFFECTS[id(light_effect_idx)]);
+          call.perform();
+
+  # §feedback - Display blink: 3x 20ms-on/200ms-off
+  - id: blink_feedback
+    mode: restart
+    then:
+      - lambda: 'id(blink_active) = true;'
+      - lambda: 'id(blink_phase) = true;'
+      - delay: !lambda "return ${blink_on_ms};"
+      - lambda: 'id(blink_phase) = false;'
+      - delay: !lambda "return ${blink_off_ms};"
+      - lambda: 'id(blink_phase) = true;'
+      - delay: !lambda "return ${blink_on_ms};"
+      - lambda: 'id(blink_phase) = false;'
+      - delay: !lambda "return ${blink_off_ms};"
+      - lambda: 'id(blink_phase) = true;'
+      - delay: !lambda "return ${blink_on_ms};"
+      - lambda: 'id(blink_phase) = false;'
+      - delay: !lambda "return ${blink_off_ms};"
+      - lambda: 'id(blink_active) = false;'
+
+  # §2.1 / §11 - Cursor button animation (white)
+  - id: cursor_btn_white
+    mode: restart
+    then:
+      - lambda: |-
+          id(cursor_anim_mode) = 0;
+          id(cursor_color) = 0;
+          id(cursor_animating) = true;
+          id(cursor_anim_step) = 0;
+      - light.turn_on:
+          id: cursor_led
+          effect: "Cursor Active"
+      - delay: 80ms
+      - lambda: 'id(cursor_anim_step) = 1;'
+      - delay: 80ms
+      - lambda: 'id(cursor_anim_step) = 2;'
+      - delay: 300ms
+      - lambda: |-
+          id(cursor_animating) = false;
+          id(cursor_pos) = (id(cursor_pos) + 3) % 7;
+      - light.turn_off: cursor_led
+
+  # §2.1 - Cursor button animation (green / OK)
+  - id: cursor_btn_green
+    mode: restart
+    then:
+      - lambda: |-
+          id(cursor_anim_mode) = 0;
+          id(cursor_color) = 1;
+          id(cursor_animating) = true;
+          id(cursor_anim_step) = 0;
+      - light.turn_on:
+          id: cursor_led
+          effect: "Cursor Active"
+      - delay: 80ms
+      - lambda: 'id(cursor_anim_step) = 1;'
+      - delay: 80ms
+      - lambda: 'id(cursor_anim_step) = 2;'
+      - delay: 300ms
+      - lambda: |-
+          id(cursor_animating) = false;
+          id(cursor_pos) = (id(cursor_pos) + 3) % 7;
+      - light.turn_off: cursor_led
+
+  # §2.1 - Cursor button animation (red / ESC)
+  - id: cursor_btn_red
+    mode: restart
+    then:
+      - lambda: |-
+          id(cursor_anim_mode) = 0;
+          id(cursor_color) = 2;
+          id(cursor_animating) = true;
+          id(cursor_anim_step) = 0;
+      - light.turn_on:
+          id: cursor_led
+          effect: "Cursor Active"
+      - delay: 80ms
+      - lambda: 'id(cursor_anim_step) = 1;'
+      - delay: 80ms
+      - lambda: 'id(cursor_anim_step) = 2;'
+      - delay: 300ms
+      - lambda: |-
+          id(cursor_animating) = false;
+          id(cursor_pos) = (id(cursor_pos) + 3) % 7;
+      - light.turn_off: cursor_led
+
+# --- INTERVALS ---
+interval:
+  # §5 - Idle display cycling every 2s
+  - interval: ${idle_interval}
+    then:
+      - lambda: |-
+          if (id(device_on) && id(edit_mode) == 0) {
+            id(idle_screen) = (id(idle_screen) + 1) % 3;
+            id(scroll_offset) = 0;  // Reset scroll on screen change
+          }
+
+  # §7.3 - Countdown timer (1s tick)
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (id(device_on) && id(timer_running) && id(timer_remaining_sec) > 0) {
+            id(timer_remaining_sec)--;
+            if (id(timer_remaining_sec) == 0) {
+              // §7.3 - Timer expired: stop fan, device stays ON
+              id(fan_pwm_output).set_level(0.0f);
+              id(timer_running) = false;
+              // Turn off progress LED (fan stopped)
+              auto call = id(progress_led).turn_off();
+              call.perform();
+            }
+          }
+
+  # Scroll text for long strings (150ms per step)
+  - interval: 150ms
+    then:
+      - lambda: |-
+          if (id(device_on) && id(edit_mode) == 0 && id(idle_screen) == 0) {
+            id(scroll_offset)++;
+          }
