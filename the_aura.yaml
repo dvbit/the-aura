@@ -25,7 +25,9 @@ substitutions:
   pin_fan_pwm: GPIO13
   pin_fan_rpm: GPIO14
   pin_progress_led: GPIO7
+  pin_progress_numled: "20"
   pin_cursor_led: GPIO18
+  pin_cursor_numled: "10"
   pin_buzzer: GPIO6
   pin_spi_clk: GPIO21
   pin_spi_mosi: GPIO4
@@ -355,7 +357,7 @@ light:
               int rem_sec = id(timer_remaining_sec);
               int num_lit = 0;
               if (set_sec > 0) {
-                num_lit = (int)round((float)rem_sec / (float)set_sec * 20.0f);
+                num_lit = (int)round((float)rem_sec / (float)set_sec * (float)it.size());
               }
               for (int i = 0; i < it.size(); i++) {
                 if (i < num_lit) {
@@ -423,16 +425,16 @@ light:
             if (mode == 0) {
               // §2.1 - Button press: progressive from cursor_pos
               for (int i = 0; i <= step && i < 3; i++) {
-                it[(id(cursor_pos) + i) % 7] = c;
+                it[(id(cursor_pos) + i) % ${pin_cursor_numled}] = c;
               }
             } else if (mode == 1) {
               // §4.1 - Power ON: clockwise from LED 0
-              for (int i = 0; i <= step && i < 7; i++) {
+              for (int i = 0; i <= step && i < ${pin_cursor_numled}; i++) {
                 it[i] = c;
               }
             } else if (mode == 2) {
               // §4.2 - Power OFF: all on, then off anti-clockwise from 0
-              for (int i = step; i < 7; i++) {
+              for (int i = step; i < ${pin_cursor_numled}; i++) {
                 it[i] = c;
               }
             }
@@ -554,20 +556,12 @@ binary_sensor:
         - light.turn_on:
             id: cursor_led
             effect: "Cursor Active"
-        # Animate 7 LEDs one by one (100ms each)
-        - delay: !lambda "return ${anim_step_ms};"
-        - lambda: 'id(cursor_anim_step) = 1;'
-        - delay: !lambda "return ${anim_step_ms};"
-        - lambda: 'id(cursor_anim_step) = 2;'
-        - delay: !lambda "return ${anim_step_ms};"
-        - lambda: 'id(cursor_anim_step) = 3;'
-        - delay: !lambda "return ${anim_step_ms};"
-        - lambda: 'id(cursor_anim_step) = 4;'
-        - delay: !lambda "return ${anim_step_ms};"
-        - lambda: 'id(cursor_anim_step) = 5;'
-        - delay: !lambda "return ${anim_step_ms};"
-        - lambda: 'id(cursor_anim_step) = 6;'
-        - delay: !lambda "return ${anim_step_ms};"
+        # Animate LEDs one by one (${anim_step_ms}ms each)
+        - repeat:
+            count: !lambda "return ${pin_cursor_numled};"
+            then:
+              - delay: !lambda "return ${anim_step_ms};"
+              - lambda: 'id(cursor_anim_step)++;'
         # §4.1 - Animation complete, turn off cursor
         - lambda: 'id(cursor_animating) = false;'
         - light.turn_off: cursor_led
@@ -604,19 +598,11 @@ binary_sensor:
         - light.turn_on:
             id: cursor_led
             effect: "Cursor Active"
-        - delay: !lambda "return ${anim_step_ms};"
-        - lambda: 'id(cursor_anim_step) = 1;'
-        - delay: !lambda "return ${anim_step_ms};"
-        - lambda: 'id(cursor_anim_step) = 2;'
-        - delay: !lambda "return ${anim_step_ms};"
-        - lambda: 'id(cursor_anim_step) = 3;'
-        - delay: !lambda "return ${anim_step_ms};"
-        - lambda: 'id(cursor_anim_step) = 4;'
-        - delay: !lambda "return ${anim_step_ms};"
-        - lambda: 'id(cursor_anim_step) = 5;'
-        - delay: !lambda "return ${anim_step_ms};"
-        - lambda: 'id(cursor_anim_step) = 6;'
-        - delay: !lambda "return ${anim_step_ms};"
+        - repeat:
+            count: !lambda "return ${pin_cursor_numled};"
+            then:
+              - delay: !lambda "return ${anim_step_ms};"
+              - lambda: 'id(cursor_anim_step)++;'
         - lambda: |-
             id(cursor_animating) = false;
             id(display_msg) = 0;
@@ -1009,7 +995,7 @@ script:
       - delay: 300ms
       - lambda: |-
           id(cursor_animating) = false;
-          id(cursor_pos) = (id(cursor_pos) + 3) % 7;
+          id(cursor_pos) = (id(cursor_pos) + 3) % ${pin_cursor_numled};
       - light.turn_off: cursor_led
 
   # §2.1 - Cursor button animation (green / OK)
@@ -1031,7 +1017,7 @@ script:
       - delay: 300ms
       - lambda: |-
           id(cursor_animating) = false;
-          id(cursor_pos) = (id(cursor_pos) + 3) % 7;
+          id(cursor_pos) = (id(cursor_pos) + 3) % ${pin_cursor_numled};
       - light.turn_off: cursor_led
 
   # §2.1 - Cursor button animation (red / ESC)
@@ -1053,7 +1039,7 @@ script:
       - delay: 300ms
       - lambda: |-
           id(cursor_animating) = false;
-          id(cursor_pos) = (id(cursor_pos) + 3) % 7;
+          id(cursor_pos) = (id(cursor_pos) + 3) % ${pin_cursor_numled};
       - light.turn_off: cursor_led
 
 # --- INTERVALS ---
