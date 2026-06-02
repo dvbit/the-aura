@@ -18,7 +18,7 @@
 | Buzzer | PWM, GPIO6 |
 | Fan | LEDC PWM 25kHz (GPIO13), RPM pulse counter (GPIO14) |
 | Progress LED | 20× WS2812 GRB ring (GPIO7) |
-| Cursor LED | 7× WS2811 GRB ring (GPIO18) |
+| Cursor LED | 10× WS2811 GRB ring (GPIO18) |
 | Buttons | 4 bistable (Power, Wind, Light, Time) + 4 momentary (Plus, Minus, OK, ESC) |
 
 ### Pin Map
@@ -124,6 +124,8 @@ All timing and behavior parameters are defined in the `substitutions:` section a
 | `anim_step_ms` | 100 | Power animation delay per LED (ms) |
 | `hue_step` | 10 | HSV hue increment per press (°) |
 | `idle_interval` | 2s | Idle display cycle interval |
+| `pin_progress_numled` | 20 | Number of Progress ring LEDs |
+| `pin_cursor_numled` | 10 | Number of Cursor ring LEDs |
 
 ## Specification
 
