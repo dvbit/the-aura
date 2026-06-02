@@ -19,6 +19,8 @@ substitutions:
   hue_step: "10"
   # §5 - Idle display cycle interval
   idle_interval: "2s"
+  pin_progress_numled: "20"
+  pin_cursor_numled: "10"
   # Pin assignments (§1 hardware)
   pin_fan_pwm: GPIO13
   pin_fan_rpm: GPIO14
@@ -305,7 +307,7 @@ light:
     variant: WS2812X
     type: GRB
     pin: ${pin_progress_led}
-    num_leds: 20
+    num_leds: ${pin_progress_numled}
     method:
       type: esp32_rmt
       channel: 0
@@ -394,7 +396,7 @@ light:
     variant: WS2811
     type: GRB
     pin: ${pin_cursor_led}
-    num_leds: 7
+    num_leds: ${pin_cursor_numled}
     method:
       type: esp32_rmt
       channel: 1
